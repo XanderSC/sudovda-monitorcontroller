@@ -3,8 +3,11 @@
 # automatically at login.
 #
 # Re-running it is safe - it will simply overwrite the existing task definition.
+#
+# This script lives in the "Common" folder. The main script lives one level
+# up, in "Controller".
 
-$scriptPath = "$PSScriptRoot\SudoVDA-MonitorController.ps1"
+$scriptPath = "$PSScriptRoot\..\Controller\SudoVDA-MonitorController.ps1"
 $batPath = "$PSScriptRoot\RunMonitorController.bat"
 
 if (-not (Test-Path $scriptPath)) {
