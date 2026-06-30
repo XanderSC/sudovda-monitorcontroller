@@ -1,0 +1,298 @@
+# SudoVDA Monitor Controller
+#
+# Automatically disconnects physical monitors when a Steam Remote Play / Steam Link
+# stream starts (via a SudoVDA virtual display) and restores them when the stream ends.
+#
+# Fully agnostic:
+#   - Works with any number or type of physical monitors (dynamically detected)
+#   - Works with any game or app being streamed (only watches monitor count)
+#   - Works with any streaming client (detects SudoVDA by driver name, not client name)
+#   - Fully portable - uses $PSScriptRoot, no hardcoded paths
+#
+# Requires: MultiMonitorTool.exe (NirSoft) placed in this same folder.
+# Download: https://www.nirsoft.net/utils/multi_monitor_tool.html
+
+# --- Configuration ---
+# $PSScriptRoot automatically resolves to wherever this script is located.
+# Move the whole folder anywhere and it still works - no changes needed.
+$scriptRoot = $PSScriptRoot
+$logPath = "$scriptRoot\SudoVDA-MonitorController.log"
+$multiMonitorTool = "$scriptRoot\MultiMonitorTool.exe"
+$normalConfig = "$scriptRoot\MonitorConfig-Normal.cfg"
+$tempMonitorFile = "$scriptRoot\monitors-temp.txt"
+
+# Unique WMI source identifier - avoids colliding with other scripts that might
+# also be watching for device change events on the same machine.
+$wmiSourceId = "SudoVDA-DeviceChange"
+
+function Write-Log {
+    param([string]$Message)
+    # Strip newlines to prevent log injection from device names containing control characters
+    $sanitised = $Message -replace '[\r\n]', ' '
+    $timestamp = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $entry = "$timestamp - $sanitised"
+    Write-Host $entry
+    Add-Content -Path $logPath -Value $entry
+}
+
+function Test-Dependencies {
+    if (-not (Test-Path $multiMonitorTool)) {
+        Write-Log "ERROR: MultiMonitorTool.exe not found at $multiMonitorTool"
+        Write-Log "Download it from https://www.nirsoft.net/utils/multi_monitor_tool.html and place it in this folder"
+        exit 1
+    }
+
+    # Use .NET SHA256 directly instead of Get-FileHash - Get-FileHash depends on a
+    # module that may fail to auto-load in non-interactive scheduled task sessions.
+    $hashFile = "$scriptRoot\MultiMonitorTool.sha256"
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $fileBytes = [System.IO.File]::ReadAllBytes($multiMonitorTool)
+    $currentHash = [System.BitConverter]::ToString($sha256.ComputeHash($fileBytes)) -replace '-', ''
+    $sha256.Dispose()
+
+    if (-not (Test-Path $hashFile)) {
+        Write-Log "First run - recording MultiMonitorTool.exe hash: $currentHash"
+        Set-Content $hashFile -Value $currentHash
+    } else {
+        $expectedHash = (Get-Content $hashFile).Trim()
+        if ($currentHash -ne $expectedHash) {
+            Write-Log "ERROR: MultiMonitorTool.exe hash mismatch - the binary may have been modified or replaced"
+            Write-Log "Expected: $expectedHash"
+            Write-Log "Found:    $currentHash"
+            Write-Log "If you intentionally updated the tool, delete $hashFile and restart the script"
+            exit 1
+        }
+        Write-Log "MultiMonitorTool.exe integrity verified"
+    }
+
+    # Warn (don't block) if non-admin accounts have write access to this folder.
+    # Use .NET directly instead of Get-Acl for the same non-interactive-session reason as above.
+    try {
+        $acl = [System.IO.Directory]::GetAccessControl($scriptRoot)
+        $currentUser = $env:USERNAME
+        $nonAdminWrite = $acl.Access | Where-Object {
+            $_.FileSystemRights -match "Write|FullControl" -and
+            $_.IdentityReference -notmatch "SYSTEM|Administrators|$currentUser"
+        }
+        if ($nonAdminWrite) {
+            Write-Log "WARNING: Other accounts have write access to this script's folder - review permissions if this machine is shared"
+            foreach ($entry in $nonAdminWrite) {
+                Write-Log "  - $($entry.IdentityReference): $($entry.FileSystemRights)"
+            }
+        }
+    } catch {
+        Write-Log "WARNING: Could not check folder permissions - $_"
+    }
+}
+
+# Clean up any stale event subscriptions left over from a previous run that crashed
+# or was killed without reaching the finally block.
+Get-EventSubscriber -SourceIdentifier $wmiSourceId -ErrorAction SilentlyContinue | Unregister-Event -Force
+Get-Event -SourceIdentifier $wmiSourceId -ErrorAction SilentlyContinue | Remove-Event
+
+function Get-ActiveMonitorCount {
+    return (Get-PnpDevice -Class Monitor -Status OK | Measure-Object).Count
+}
+
+function Get-SudoVDADisplayName {
+    # Use script-local temp file instead of shared $env:TEMP
+    & $multiMonitorTool /stext $tempMonitorFile
+    Start-Sleep -Seconds 1
+    if (-not (Test-Path $tempMonitorFile)) {
+        Write-Log "WARNING: Monitor info file was not created by MultiMonitorTool"
+        return $null
+    }
+    $content = Get-Content $tempMonitorFile -Raw
+    Remove-Item $tempMonitorFile -Force -ErrorAction SilentlyContinue
+
+    $displays = $content -split "={10,}" | Where-Object { $_.Trim() -ne "" }
+    foreach ($display in $displays) {
+        # Match on the SudoVDA driver's adapter name - this stays constant across
+        # sessions and across different streaming client devices, unlike the
+        # display number (which increments each session) or monitor friendly
+        # name (which the client device borrows).
+        if ($display -match "SudoMaker Virtual Display Adapter") {
+            if ($display -match "Name\s+:\s+(\\\\\.\\DISPLAY\d+)") {
+                $displayName = $matches[1]
+                Write-Log "Found SudoVDA display: $displayName"
+                return $displayName
+            }
+        }
+    }
+    Write-Log "WARNING: SudoVDA display not found"
+    return $null
+}
+
+function Get-PhysicalDisplayNames {
+    & $multiMonitorTool /stext $tempMonitorFile
+    Start-Sleep -Seconds 1
+    if (-not (Test-Path $tempMonitorFile)) {
+        Write-Log "WARNING: Monitor info file was not created by MultiMonitorTool"
+        return @()
+    }
+    $content = Get-Content $tempMonitorFile -Raw
+    Remove-Item $tempMonitorFile -Force -ErrorAction SilentlyContinue
+
+    $displays = $content -split "={10,}" | Where-Object { $_.Trim() -ne "" }
+    $physicalDisplays = @()
+    foreach ($display in $displays) {
+        if ($display -match "SudoMaker Virtual Display Adapter") { continue }
+        if ($display -match "Active\s+:\s+Yes" -and $display -match "Disconnected\s+:\s+No") {
+            if ($display -match "Name\s+:\s+(\\\\\.\\DISPLAY\d+)") {
+                $physicalDisplays += $matches[1]
+            }
+        }
+    }
+    Write-Log "Found physical display(s): $($physicalDisplays -join ', ')"
+    return $physicalDisplays
+}
+
+function Disable-PhysicalMonitors {
+    Write-Log "Saving current monitor layout..."
+    & $multiMonitorTool /SaveConfig $normalConfig
+    Start-Sleep -Seconds 1
+
+    $sudoVDA = Get-SudoVDADisplayName
+    if ($sudoVDA) {
+        Write-Log "Setting SudoVDA ($sudoVDA) as primary display..."
+        & $multiMonitorTool /SetPrimary $sudoVDA
+        Start-Sleep -Seconds 2
+    } else {
+        Write-Log "WARNING: Could not find SudoVDA display - skipping primary switch"
+    }
+
+    $physicalDisplays = Get-PhysicalDisplayNames
+    if ($physicalDisplays.Count -eq 0) {
+        Write-Log "WARNING: No physical displays found to disable"
+        return
+    }
+    Write-Log "Disabling $($physicalDisplays.Count) physical monitor(s)..."
+    foreach ($display in $physicalDisplays) {
+        Write-Log "Disabling $display..."
+        & $multiMonitorTool /disable $display
+    }
+    Write-Log "Physical monitors disabled"
+}
+
+function Enable-PhysicalMonitors {
+    if (-not (Test-Path $normalConfig)) {
+        Write-Log "WARNING: No saved monitor config found - skipping restore"
+        return
+    }
+    Write-Log "Restoring physical monitor layout..."
+    & $multiMonitorTool /LoadConfig $normalConfig
+    Start-Sleep -Seconds 2
+    Write-Log "Physical monitors restored"
+}
+
+function Set-MonitorsSleep {
+    Write-Log "Stream detected - disabling physical monitors"
+    Start-Sleep -Seconds 3
+    Disable-PhysicalMonitors
+    Write-Log "Monitoring for stream end..."
+}
+
+function Set-MonitorsWake {
+    Write-Log "Stream ended - restoring physical monitors"
+    Enable-PhysicalMonitors
+}
+
+# --- Startup ---
+Write-Log "========================================"
+Write-Log "SudoVDA Monitor Controller started"
+Write-Log "========================================"
+
+# Verify dependencies
+Test-Dependencies
+
+# Save monitor config if it doesn't exist yet
+if (-not (Test-Path $normalConfig)) {
+    Write-Log "No saved monitor config found - saving current layout as the baseline..."
+    & $multiMonitorTool /SaveConfig $normalConfig
+    Write-Log "Monitor config saved to $normalConfig"
+} else {
+    Write-Log "Monitor config found at $normalConfig"
+}
+
+# Calculate the baseline (non-streaming) monitor count dynamically at startup rather
+# than hardcoding it, so the script adapts automatically if monitors are ever added
+# or removed. If a stream is already active when the script starts, back the SudoVDA
+# display out of the count to get the correct baseline.
+$sudoVDAAtStartup = Get-SudoVDADisplayName
+$currentCount = Get-ActiveMonitorCount
+
+if ($sudoVDAAtStartup) {
+    $script:baselineCount = $currentCount - 1
+    Write-Log "Stream active on startup - baseline calculated as $($script:baselineCount) monitor(s)"
+} else {
+    $script:baselineCount = $currentCount
+    Write-Log "No stream on startup - baseline set to $($script:baselineCount) monitor(s)"
+}
+
+$script:isStreaming = $null -ne $sudoVDAAtStartup
+Write-Log "Current monitor count: $currentCount (streaming: $($script:isStreaming))"
+
+if ($script:isStreaming) {
+    Write-Log "Stream already active on startup - disabling physical monitors..."
+    Set-MonitorsSleep
+}
+
+# Prefer event-driven detection (near-instant reaction), but fall back to polling
+# if WMI event registration fails - this can happen in some non-interactive
+# scheduled task sessions.
+$usePolling = $false
+try {
+    Register-WmiEvent -Query "SELECT * FROM Win32_DeviceChangeEvent WHERE EventType = 2 OR EventType = 3" `
+        -SourceIdentifier $wmiSourceId -ErrorAction Stop | Out-Null
+    Write-Log "WMI event watcher registered successfully"
+} catch {
+    Write-Log "WARNING: Failed to register WMI event watcher - $_ - falling back to polling mode"
+    $usePolling = $true
+}
+
+try {
+    Write-Log "Entering monitoring loop (polling: $usePolling)..."
+    while ($true) {
+        if ($usePolling) {
+            Start-Sleep -Seconds 5
+            $newCount = Get-ActiveMonitorCount
+
+            if ($newCount -gt $script:baselineCount -and -not $script:isStreaming) {
+                Write-Log "Stream start detected - monitor count: $newCount"
+                $script:isStreaming = $true
+                Set-MonitorsSleep
+            }
+            elseif ($newCount -le $script:baselineCount -and $script:isStreaming) {
+                Write-Log "Stream end detected - monitor count: $newCount"
+                $script:isStreaming = $false
+                Set-MonitorsWake
+            }
+        } else {
+            $event = Wait-Event -SourceIdentifier $wmiSourceId -Timeout 60
+            if ($event) { Remove-Event -SourceIdentifier $wmiSourceId }
+
+            Start-Sleep -Seconds 2
+            $newCount = Get-ActiveMonitorCount
+            Write-Log "Device change detected - monitor count: $newCount (streaming: $($script:isStreaming))"
+
+            if ($newCount -gt $script:baselineCount -and -not $script:isStreaming) {
+                $script:isStreaming = $true
+                Set-MonitorsSleep
+            }
+            elseif ($newCount -le $script:baselineCount -and $script:isStreaming) {
+                $script:isStreaming = $false
+                Set-MonitorsWake
+            }
+        }
+    }
+}
+finally {
+    # Always restore monitors on exit, regardless of how the script stops
+    # (Ctrl+C, crash, task termination, normal completion).
+    Write-Log "Script exiting - restoring all settings..."
+    Enable-PhysicalMonitors
+    Unregister-Event -SourceIdentifier $wmiSourceId -ErrorAction SilentlyContinue
+    Remove-Item $tempMonitorFile -Force -ErrorAction SilentlyContinue
+    Write-Log "Monitor controller stopped"
+    Write-Log "========================================"
+}

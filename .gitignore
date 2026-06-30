@@ -1,0 +1,8 @@
+# Runtime-generated files - personal to each install, should never be committed
+SudoVDA-MonitorController.log
+MonitorConfig-Normal.cfg
+MultiMonitorTool.sha256
+monitors-temp.txt
+
+# The MultiMonitorTool binary itself is not redistributable - see README
+MultiMonitorTool.exe
