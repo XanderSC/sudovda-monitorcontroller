@@ -292,13 +292,14 @@ try {
 
             Start-Sleep -Seconds 2
             $newCount = Get-ActiveMonitorCount
-            Write-Log "Device change detected - monitor count: $newCount (streaming: $($script:isStreaming))"
 
             if ($newCount -gt $script:baselineCount -and -not $script:isStreaming) {
+                Write-Log "Device change detected - monitor count: $newCount (streaming: $($script:isStreaming))"
                 $script:isStreaming = $true
                 Set-MonitorsSleep
             }
             elseif ($newCount -le $script:baselineCount -and $script:isStreaming) {
+                Write-Log "Device change detected - monitor count: $newCount (streaming: $($script:isStreaming))"
                 $script:isStreaming = $false
                 Set-MonitorsWake
             }
